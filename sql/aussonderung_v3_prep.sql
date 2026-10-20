@@ -51,6 +51,118 @@ EXEC create_dummy 'addon_prep_loeschen', 'P '
 GO
 EXEC create_dummy 'addon_aussondstatus_ex', 'P '
 GO
+EXEC create_dummy 'addon_aussondstatus_multi', 'P '
+GO
+ALTER PROCEDURE [dbo].[addon_aussondstatus_multi] (
+    @i_status_id INT,
+    @i_start_ltp INT = 0      -- 1 -> die Renditionbildung mit anstossen
+)
+AS
+-- *************************************************************************************************************************
+-- Letzte Änderung:
+-- Datum:          20.10.2026
+-- Entwickler:     Claude Code
+-- Bemerkung:      Mengenbasierte Variante von addon_aussondstatus_ex.
+--                 Setzt den Aussonderungsstatus rekursiv für ALLE Objekte aus #AUSSOND_ROOTS (obj_id) in einem Durchgang.
+--                 #AUSSOND_ROOTS muss vom Aufrufer angelegt und befüllt werden.
+--                 Akte/Vorgang/Dokument werden blockweise mengenbasiert aktualisiert statt Zeile für Zeile,
+--                 vpl2_ltpprep_object wird je Dokument genau einmal aufgerufen.
+-- *************************************************************************************************************************
+BEGIN
+    SET NOCOUNT ON
+
+    DECLARE @m_blockgroesse INT = 4000;     -- < 5000 Sperren pro Statement -> keine Lock Escalation auf Tabellenebene
+    DECLARE @m_von          INT = 1;
+    DECLARE @m_max_idx      INT = 0;
+    DECLARE @m_counter      INT = 0;
+    DECLARE @m_obj_id       INT;
+
+    -- Alle Nachfahren aller Startobjekte einmalig über die Hierarchie bestimmen (Mehrfachtreffer nur einmal)
+    CREATE TABLE #AUSSOND_NACHFAHREN
+    (
+        obj_id INT NOT NULL PRIMARY KEY
+    );
+
+    INSERT INTO #AUSSOND_NACHFAHREN ( obj_id )
+    SELECT DISTINCT h.sohn_id
+      FROM #AUSSOND_ROOTS r
+     INNER JOIN vis_prim_hierarchie h ON h.vater_id = r.obj_id
+     WHERE h.sohn_id IS NOT NULL;
+
+    CREATE TABLE #AUSSOND_ZIEL
+    (
+        idx          INT IDENTITY PRIMARY KEY,
+        obj_id       INT NOT NULL,
+        objektart_id INT NOT NULL
+    );
+
+    INSERT INTO #AUSSOND_ZIEL ( obj_id, objektart_id )
+    SELECT DISTINCT sg.obj_id, sg.objektart_id
+      FROM #AUSSOND_NACHFAHREN n
+     INNER JOIN vsg_schriftgut_view sg ON sg.obj_id = n.obj_id
+     WHERE sg.objektart_id IN (1, 3, 12, 13, 14, 15, 100, 101);
+
+    SELECT @m_max_idx = ISNULL(MAX(idx), 0) FROM #AUSSOND_ZIEL;
+
+    WHILE @m_von <= @m_max_idx
+    BEGIN
+        UPDATE a SET aussondstatus = @i_status_id, version_id = -1
+          FROM vsg_akte a
+         INNER JOIN #AUSSOND_ZIEL z ON z.obj_id = a.obj_id
+         WHERE z.idx BETWEEN @m_von AND @m_von + @m_blockgroesse - 1
+           AND z.objektart_id = 1;
+
+        UPDATE v SET aussondstatus = @i_status_id, version_id = -1
+          FROM vsg_vorgang v
+         INNER JOIN #AUSSOND_ZIEL z ON z.obj_id = v.obj_id
+         WHERE z.idx BETWEEN @m_von AND @m_von + @m_blockgroesse - 1
+           AND z.objektart_id = 3;
+
+        if (IsNULL(@i_start_ltp,0) <> 1)
+        BEGIN
+            UPDATE d SET aussondstatus = @i_status_id, version_id = -1
+              FROM vsg_dokument d
+             INNER JOIN #AUSSOND_ZIEL z ON z.obj_id = d.obj_id
+             WHERE z.idx BETWEEN @m_von AND @m_von + @m_blockgroesse - 1
+               AND z.objektart_id IN (12, 13, 14, 15, 100, 101);
+        END;
+
+        SET @m_von = @m_von + @m_blockgroesse;
+    END; -- WHILE Bloecke
+
+    if (IsNULL(@i_start_ltp,0) = 1)
+    BEGIN
+        -- Renditionbildung je Dokument genau einmal anstossen
+        CREATE TABLE #AUSSOND_LTP
+        (
+            idx    INT IDENTITY PRIMARY KEY,
+            obj_id INT NOT NULL
+        );
+
+        INSERT INTO #AUSSOND_LTP ( obj_id )
+        SELECT DISTINCT obj_id
+          FROM #AUSSOND_ZIEL
+         WHERE objektart_id IN (12, 13, 14, 15, 100, 101);
+
+        SELECT @m_max_idx = ISNULL(MAX(idx), 0) FROM #AUSSOND_LTP;
+
+        WHILE @m_counter < @m_max_idx
+        BEGIN
+            SET @m_counter = @m_counter + 1;
+
+            SELECT @m_obj_id = obj_id FROM #AUSSOND_LTP WHERE idx = @m_counter;
+
+            exec vpl2_ltpprep_object @m_obj_id;
+        END; -- WHILE AUSSOND_LTP
+
+        DROP TABLE #AUSSOND_LTP;
+    END;
+
+    DROP TABLE #AUSSOND_ZIEL;
+    DROP TABLE #AUSSOND_NACHFAHREN;
+END;
+    --ENDE-- addon_aussondstatus_multi --
+GO
 ALTER PROCEDURE [dbo].[addon_aussondstatus_ex]( @i_obj_id INT,
     @i_status_id INT,
     @i_start_ltp INT = 0      -- 1 -> die Renditionbildung mit anstossen
@@ -58,65 +170,30 @@ ALTER PROCEDURE [dbo].[addon_aussondstatus_ex]( @i_obj_id INT,
 AS
 -- *************************************************************************************************************************
 -- Letzte Änderung:
--- Datum:          14.01.2025
--- Entwickler:     SSW
+-- Datum:          20.10.2026
+-- Entwickler:     Claude Code
 -- Bemerkung:      Auusonderungsstatus an Akte und Vorgang setzen 
 --                 An Dokumenten immer in "Vorbereitung Langzeitspeicherung"
+--                 Performance: Schnittstelle unverändert, Verarbeitung mengenbasiert über addon_aussondstatus_multi
 -- *************************************************************************************************************************
-DECLARE @m_objektart_id INT;
-DECLARE @m_counter INT = 0;
-DECLARE @m_obj_id INT;
 BEGIN
     SET NOCOUNT ON
-    
-    CREATE TABLE #aussondstatus_ex
-    (
-        idx INT      IDENTITY PRIMARY KEY,
-        obj_id       INT,
-        objektart_id INT
-    );
-    
-    INSERT INTO #aussondstatus_ex
-    (
-        obj_id,
-        objektart_id
-    )
-    SELECT sg.obj_id, sg.objektart_id FROM vsg_schriftgut_view sg INNER JOIN vis_prim_hierarchie h ON sg.OBJ_ID = h.sohn_id
-    where h.vater_id = @i_obj_id;
 
-    WHILE @m_counter < (SELECT MAX(idx) FROM #aussondstatus_ex)
+    if (@i_obj_id IS NULL)
     BEGIN
-        SET @m_counter = @m_counter + 1;
-           
-        SELECT @m_obj_id = obj_id, 
-               @m_objektart_id = objektart_id 
-          FROM #aussondstatus_ex
-         WHERE idx = @m_counter;
-            
-        if (@m_objektart_id = 1)
-        begin
-            UPDATE vsg_akte SET aussondstatus = @i_status_id, version_id = -1 WHERE obj_id = @m_obj_id;
-        END;
-        
-        if (@m_objektart_id = 3)
-        begin
-            UPDATE vsg_vorgang SET aussondstatus = @i_status_id, version_id = -1 WHERE obj_id = @m_obj_id;
-        END;
-        
-        if (@m_objektart_id in (12,13,14,15,100,101))
-        BEGIN
-            if (IsNULL(@i_start_ltp,0) = 1)
-            BEGIN
-               exec vpl2_ltpprep_object @m_obj_id;
-            END
-            ELSE
-			BEGIN
-               UPDATE vsg_dokument SET aussondstatus = @i_status_id, version_id = -1 WHERE obj_id = @m_obj_id;
-            END;
-        END;
-            
-     END; -- WHILE aussondstatus_ex
-        
+        return;
+    END;
+
+    CREATE TABLE #AUSSOND_ROOTS
+    (
+        obj_id INT NOT NULL PRIMARY KEY
+    );
+
+    INSERT INTO #AUSSOND_ROOTS ( obj_id ) VALUES ( @i_obj_id );
+
+    exec dbo.addon_aussondstatus_multi @i_status_id, @i_start_ltp;
+
+    DROP TABLE #AUSSOND_ROOTS;
 END;
     --ENDE-- addon_aussondstatus_ex --
 GO
@@ -126,20 +203,21 @@ ALTER PROCEDURE addon_prep_archivieren (
 AS
 -- *************************************************************************************************************************
 -- Letzte Änderung:
--- Datum:         13.01.2025
--- Entwickler:    SSW
+-- Datum:         20.10.2026
+-- Entwickler:    Claude Code
 -- Bemerkung:     SAX-961  DB Skript um alles aussonderungsfähige Schriftgut in die Archivierenmappe zu bekommen
+--                Performance: alle gefundenen Akten bzw. Vorgänge in einem Durchgang über addon_aussondstatus_multi
 -- *************************************************************************************************************************
 BEGIN
     SET NOCOUNT ON
     SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED
     DECLARE @m_aussondart_archivieren INT = -3021;   -- Archivieren A
     DECLARE @m_counter_objekte     INT = 0;
+    DECLARE @m_max_idx             INT = 0;
     
     DECLARE @m_obj_id              INT;
     DECLARE @m_objektart_id        INT; 
     DECLARE @m_gz                  NVARCHAR(150);
-    DECLARE @m_aussonderungsart    INT;
     DECLARE @m_aussondstatus       INT;
     DECLARE @m_av3_enabled         INT;
     
@@ -155,30 +233,17 @@ BEGIN
        PRINT @msg;
        return;
     END;
-    
-    CREATE TABLE #AUSSOND_SGO
-    (
-       idx INT IDENTITY PRIMARY KEY,
-       obj_id            INT,
-       objektart_id      INT,
-       gz                NVARCHAR(150),
-       aussonderungsart  INT,
-       aussondstatus     INT
-    );
 
     if ( LEN(ISNULL(@i_gz_mappe, '')) = 0 )
     BEGIN  
-       -- Wenn keine Aussonderungsmappe übergeben wurde, alles Aussonderungsfähige Schriftgut machen
-        
-        INSERT INTO #AUSSOND_SGO
+        -- Wenn keine Aussonderungsmappe übergeben wurde, alles Aussonderungsfähige Schriftgut machen
+        CREATE TABLE #AUSSOND_ROOTS
         (
-           obj_id,
-           objektart_id,
-           gz,
-           aussonderungsart,
-           aussondstatus
-        )
-        select OBJ_ID, 1, GZ, AUSSONDERUNGSART, AUSSONDSTATUS 
+           obj_id INT NOT NULL PRIMARY KEY
+        );
+        
+        INSERT INTO #AUSSOND_ROOTS ( obj_id )
+        select DISTINCT OBJ_ID
         from vsg_akte
         where ABGESCHLOSSEN = 1
         and AUSSONDERUNG_AM < getdate()
@@ -190,39 +255,16 @@ BEGIN
            -10938   -- an Archiv abgegeben
         );
         
-        SELECT @msg = CONVERT(NVARCHAR, COUNT(OBJ_ID)) + ' Akten mit Aussonderungsart Archivieren gefunden' FROM #AUSSOND_SGO;
+        SET @msg = CONVERT(NVARCHAR, @@ROWCOUNT) + ' Akten mit Aussonderungsart Archivieren gefunden';
         PRINT @msg;
         
-        WHILE @m_counter_objekte < (SELECT MAX(idx) FROM #AUSSOND_SGO)
-        BEGIN
-           SET @m_counter_objekte = @m_counter_objekte + 1;
-           
-           SELECT @m_obj_id = obj_id, 
-                  @m_objektart_id = objektart_id, 
-                  @m_gz = gz,
-                  @m_aussonderungsart = AUSSONDERUNGSART, 
-                  @m_aussondstatus = aussondstatus 
-             FROM #AUSSOND_SGO
-            WHERE idx = @m_counter_objekte;
-            
-            exec dbo.addon_aussondstatus_ex @m_obj_id, -10962, 0;       -- Aussonderungsstatus auf Langzeitspeicherung rekursiv setzen 
-            
-            
-            
-        END; -- WHILE AUSSOND_SGOs
+        exec dbo.addon_aussondstatus_multi -10962, 0;       -- Aussonderungsstatus auf Langzeitspeicherung rekursiv setzen 
         
-        TRUNCATE TABLE #AUSSOND_SGO;
-        SET @m_counter_objekte = 0;
+        -- Erst danach die Vorgänge ermitteln: Vorgänge unter den eben verarbeiteten Akten stehen jetzt auf -10962 und fallen raus
+        TRUNCATE TABLE #AUSSOND_ROOTS;
         
-        INSERT INTO #AUSSOND_SGO
-        (
-           obj_id,
-           objektart_id,
-           gz,
-           aussonderungsart,
-           aussondstatus
-        )
-        select OBJ_ID, 3, GZ, AUSSONDERUNGSART, AUSSONDSTATUS 
+        INSERT INTO #AUSSOND_ROOTS ( obj_id )
+        select DISTINCT OBJ_ID
         from vsg_vorgang
         where ABGESCHLOSSEN = 1
         and AUSSONDERUNG_AM < getdate()
@@ -234,24 +276,12 @@ BEGIN
            -10938   -- an Archiv abgegeben
         );
         
-        SELECT @msg = CONVERT(NVARCHAR, COUNT(OBJ_ID)) + ' Vorgänge mit Aussonderungsart Archivieren gefunden' FROM #AUSSOND_SGO;
+        SET @msg = CONVERT(NVARCHAR, @@ROWCOUNT) + ' Vorgänge mit Aussonderungsart Archivieren gefunden';
         PRINT @msg;
         
-        WHILE @m_counter_objekte < (SELECT MAX(idx) FROM #AUSSOND_SGO)
-        BEGIN
-           SET @m_counter_objekte = @m_counter_objekte + 1;
-           
-          SELECT @m_obj_id = obj_id, 
-                  @m_objektart_id = objektart_id, 
-                  @m_gz = gz,
-                  @m_aussonderungsart = AUSSONDERUNGSART, 
-                  @m_aussondstatus = aussondstatus 
-             FROM #AUSSOND_SGO
-            WHERE idx = @m_counter_objekte;
-            
-           exec dbo.addon_aussondstatus_ex @m_obj_id, -10962, 1;       -- Aussonderungsstatus auf Langzeitspeicherung rekursiv setzen
-            
-        END; -- WHILE AUSSOND_SGOs
+        exec dbo.addon_aussondstatus_multi -10962, 1;       -- Aussonderungsstatus auf Langzeitspeicherung rekursiv setzen
+        
+        DROP TABLE #AUSSOND_ROOTS;
     END;
     ELSE
     BEGIN
@@ -264,27 +294,35 @@ BEGIN
         
         if ( IsNULL(@mappe_obj_id ,0 ) > 0)
         BEGIN
+           CREATE TABLE #AUSSOND_SGO
+           (
+              idx INT IDENTITY PRIMARY KEY,
+              obj_id            INT,
+              objektart_id      INT,
+              gz                NVARCHAR(150),
+              aussondstatus     INT
+           );
            
            INSERT INTO #AUSSOND_SGO
            (
               obj_id,
               objektart_id,
               gz,
-              aussonderungsart,
               aussondstatus
            )
-           select s.OBJ_ID, s.OBJEKTART_ID, s.GZ, s.AUSSONDERUNGSART, s.AUSSONDSTATUS 
+           select s.OBJ_ID, s.OBJEKTART_ID, s.GZ, s.AUSSONDSTATUS 
            from vsg_mappeinhalt m 
-           inner join vis_prim_hierarchie h on h.vater_id = m.schriftgut_obj_id and primaer = 0
+           inner join vis_prim_hierarchie h on h.vater_id = m.schriftgut_obj_id and m.primaer = 0
            inner join vsg_schriftgut_view s on h.sohn_id = s.OBJ_ID
            where m.mappe_obj_id = @mappe_obj_id;
 
+           SET @m_max_idx = @@ROWCOUNT;
            SET @m_counter_objekte = 0;
 
-           SELECT @msg = CONVERT(NVARCHAR, COUNT(OBJ_ID)) + ' Geschäftsobjekte in der Mappe gefunden' FROM #AUSSOND_SGO;
+           SET @msg = CONVERT(NVARCHAR, @m_max_idx) + ' Geschäftsobjekte in der Mappe gefunden';
            PRINT @msg;
         
-           WHILE @m_counter_objekte < (SELECT MAX(idx) FROM #AUSSOND_SGO)
+           WHILE @m_counter_objekte < @m_max_idx
            BEGIN
               SET @m_counter_objekte = @m_counter_objekte + 1;
            
@@ -315,6 +353,8 @@ BEGIN
               END;
             
            END; -- WHILE AUSSOND_SGOs
+           
+           DROP TABLE #AUSSOND_SGO;
         END
         ELSE
         BEGIN
@@ -322,8 +362,6 @@ BEGIN
            PRINT @msg;
         END;
     END;
-    
-    DROP TABLE #AUSSOND_SGO;
 END
 -- END addon_prep_archivieren
 GO
@@ -333,20 +371,20 @@ ALTER PROCEDURE addon_prep_bewerten (
 AS
 -- *************************************************************************************************************************
 -- Letzte Änderung:
--- Datum:         09.01.2025
--- Entwickler:    SSW
+-- Datum:         20.10.2026
+-- Entwickler:    Claude Code
 -- Bemerkung:     SAX-960  DB Skript um alles aussonderungsfähige Schriftgut in die Bewertenmappe zu bekommen
+--                Performance: alle gefundenen Akten bzw. Vorgänge in einem Durchgang über addon_aussondstatus_multi
 -- *************************************************************************************************************************
 BEGIN
     SET NOCOUNT ON
     SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED
     DECLARE @m_aussondart_bewerten INT = -3023;   -- Bewerten
     DECLARE @m_counter_objekte     INT = 0;
+    DECLARE @m_max_idx             INT = 0;
     
     DECLARE @m_obj_id              INT;
-    DECLARE @m_objektart_id        INT; 
     DECLARE @m_gz                  NVARCHAR(150);
-    DECLARE @m_aussonderungsart    INT;
     DECLARE @m_aussondstatus       INT;
     DECLARE @m_av3_enabled         INT;
     
@@ -362,30 +400,17 @@ BEGIN
        PRINT @msg;
        return;
     END;
-    
-    CREATE TABLE #AUSSOND_SGO
-    (
-       idx INT IDENTITY PRIMARY KEY,
-       obj_id            INT,
-       objektart_id      INT,
-       gz                NVARCHAR(150),
-       aussonderungsart  INT,
-       aussondstatus     INT
-    );
 
     if ( LEN(ISNULL(@i_gz_mappe, '')) = 0 )
     BEGIN  
-       -- Wenn keine Aussonderungsmappe übergeben wurde, alles Aussonderungsfähige Schriftgut machen
-        
-        INSERT INTO #AUSSOND_SGO
+        -- Wenn keine Aussonderungsmappe übergeben wurde, alles Aussonderungsfähige Schriftgut machen
+        CREATE TABLE #AUSSOND_ROOTS
         (
-           obj_id,
-           objektart_id,
-           gz,
-           aussonderungsart,
-           aussondstatus
-        )
-        select OBJ_ID, 1, GZ, AUSSONDERUNGSART, AUSSONDSTATUS 
+           obj_id INT NOT NULL PRIMARY KEY
+        );
+        
+        INSERT INTO #AUSSOND_ROOTS ( obj_id )
+        select DISTINCT OBJ_ID
         from vsg_akte
         where ABGESCHLOSSEN = 1
         and AUSSONDERUNG_AM < getdate()
@@ -400,37 +425,16 @@ BEGIN
         )
         and not exists ( SELECT mappe_obj_id FROM vsg_mappeinhalt where schriftgut_obj_id = vsg_akte.obj_id and primaer = 0);   -- SAX-1019 Objekte dürfen in keine Mappe sein
         
-        SELECT @msg = CONVERT(NVARCHAR, COUNT(OBJ_ID)) + ' Akten mit Aussonderungsart Bewerten gefunden' FROM #AUSSOND_SGO;
+        SET @msg = CONVERT(NVARCHAR, @@ROWCOUNT) + ' Akten mit Aussonderungsart Bewerten gefunden';
         PRINT @msg;
         
-        WHILE @m_counter_objekte < (SELECT MAX(idx) FROM #AUSSOND_SGO)
-        BEGIN
-           SET @m_counter_objekte = @m_counter_objekte + 1;
-           
-           SELECT @m_obj_id = obj_id, 
-                  @m_objektart_id = objektart_id, 
-                  @m_gz = gz,
-                  @m_aussonderungsart = AUSSONDERUNGSART, 
-                  @m_aussondstatus = aussondstatus 
-             FROM #AUSSOND_SGO
-            WHERE idx = @m_counter_objekte;
-            
-           exec dbo.addon_aussondstatus_ex @m_obj_id, -10962, 0;       -- Aussonderungsstatus auf Langzeitspeicherung rekursiv setzen
-            
-        END; -- WHILE AUSSOND_SGOs
+        exec dbo.addon_aussondstatus_multi -10962, 0;       -- Aussonderungsstatus auf Langzeitspeicherung rekursiv setzen
         
-        TRUNCATE TABLE #AUSSOND_SGO;
-        SET @m_counter_objekte = 0;
+        -- Erst danach die Vorgänge ermitteln: Vorgänge unter den eben verarbeiteten Akten stehen jetzt auf -10962 und fallen raus
+        TRUNCATE TABLE #AUSSOND_ROOTS;
         
-        INSERT INTO #AUSSOND_SGO
-        (
-           obj_id,
-           objektart_id,
-           gz,
-           aussonderungsart,
-           aussondstatus
-        )
-        select OBJ_ID, 3, GZ, AUSSONDERUNGSART, AUSSONDSTATUS 
+        INSERT INTO #AUSSOND_ROOTS ( obj_id )
+        select DISTINCT OBJ_ID
         from vsg_vorgang
         where ABGESCHLOSSEN = 1
         and AUSSONDERUNG_AM < getdate()
@@ -446,24 +450,13 @@ BEGIN
         and not exists ( SELECT mappe_obj_id FROM vsg_mappeinhalt inner join vis_prim_hierarchie on vsg_mappeinhalt.schriftgut_obj_id = vis_prim_hierarchie.vater_id
                           where vis_prim_hierarchie.sohn_id = vsg_vorgang.obj_id and vsg_mappeinhalt.primaer = 0 );  -- SAX-1019 Objekte dürfen in keine Mappe sein
         
-        SELECT @msg = CONVERT(NVARCHAR, COUNT(OBJ_ID)) + ' Vorgänge mit Aussonderungsart Bewerten gefunden' FROM #AUSSOND_SGO;
+        SET @msg = CONVERT(NVARCHAR, @@ROWCOUNT) + ' Vorgänge mit Aussonderungsart Bewerten gefunden';
         PRINT @msg;
         
-        WHILE @m_counter_objekte < (SELECT MAX(idx) FROM #AUSSOND_SGO)
-        BEGIN
-           SET @m_counter_objekte = @m_counter_objekte + 1;
-           
-          SELECT @m_obj_id = obj_id, 
-                  @m_objektart_id = objektart_id, 
-                  @m_gz = gz,
-                  @m_aussonderungsart = AUSSONDERUNGSART, 
-                  @m_aussondstatus = aussondstatus 
-             FROM #AUSSOND_SGO
-            WHERE idx = @m_counter_objekte;
-            
-           exec dbo.addon_aussondstatus_ex @m_obj_id, -10962, 0;       -- Aussonderungsstatus auf Langzeitspeicherung rekursiv setzen
-            
-        END; -- WHILE AUSSOND_SGOs
+        exec dbo.addon_aussondstatus_multi -10962, 0;       -- Aussonderungsstatus auf Langzeitspeicherung rekursiv setzen
+        
+        -- vor den geschachtelten Aufrufen aufräumen, die legen eigene #AUSSOND_ROOTS an
+        DROP TABLE #AUSSOND_ROOTS;
         
         exec dbo.addon_prep_archivieren null;
         exec dbo.addon_prep_loeschen null;
@@ -478,27 +471,33 @@ BEGIN
         
         if ( IsNULL(@mappe_obj_id ,0 ) > 0)
         BEGIN
+           CREATE TABLE #AUSSOND_SGO
+           (
+              idx INT IDENTITY PRIMARY KEY,
+              obj_id            INT,
+              gz                NVARCHAR(150),
+              aussondstatus     INT
+           );
            
            INSERT INTO #AUSSOND_SGO
            (
               obj_id,
-              objektart_id,
               gz,
-              aussonderungsart,
               aussondstatus
            )
-           select s.OBJ_ID, s.OBJEKTART_ID, s.GZ, s.AUSSONDERUNGSART, s.AUSSONDSTATUS 
+           select s.OBJ_ID, s.GZ, s.AUSSONDSTATUS 
            from vsg_mappeinhalt m 
-           inner join vis_prim_hierarchie h on h.vater_id = m.schriftgut_obj_id and primaer = 0
+           inner join vis_prim_hierarchie h on h.vater_id = m.schriftgut_obj_id and m.primaer = 0
            inner join vsg_schriftgut_view s on h.sohn_id = s.OBJ_ID
            where m.mappe_obj_id = @mappe_obj_id;
 
+           SET @m_max_idx = @@ROWCOUNT;
            SET @m_counter_objekte = 0;
 
-           SELECT @msg = CONVERT(NVARCHAR, COUNT(OBJ_ID)) + ' Geschäftsobjekte in der Mappe gefunden' FROM #AUSSOND_SGO;
+           SET @msg = CONVERT(NVARCHAR, @m_max_idx) + ' Geschäftsobjekte in der Mappe gefunden';
            PRINT @msg;
         
-           WHILE @m_counter_objekte < (SELECT MAX(idx) FROM #AUSSOND_SGO)
+           WHILE @m_counter_objekte < @m_max_idx
            BEGIN
               SET @m_counter_objekte = @m_counter_objekte + 1;
            
@@ -516,6 +515,8 @@ BEGIN
               END;
             
            END; -- WHILE AUSSOND_SGOs
+           
+           DROP TABLE #AUSSOND_SGO;
         END
         ELSE
         BEGIN
@@ -523,8 +524,6 @@ BEGIN
            PRINT @msg;
         END;
     END;
-    
-    DROP TABLE #AUSSOND_SGO;
 END
 GO
 ALTER PROCEDURE [dbo].[addon_prep_dokument] (
@@ -791,20 +790,20 @@ ALTER PROCEDURE addon_prep_loeschen (
 AS
 -- *************************************************************************************************************************
 -- Letzte Änderung:
--- Datum:         16.01.2025
--- Entwickler:    SSW
+-- Datum:         20.10.2026
+-- Entwickler:    Claude Code
 -- Bemerkung:     SAX-962  DB Skript um alles aussonderungsfähige Schriftgut mit Beertung "Löschen" in die Löschmappe  zu bekommen
+--                Performance: alle gefundenen Akten bzw. Vorgänge in einem Durchgang über addon_aussondstatus_multi
 -- *************************************************************************************************************************
 BEGIN
     SET NOCOUNT ON
     SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED
     DECLARE @m_aussondart_loeschen INT = -3022;   -- Vernichten
     DECLARE @m_counter_objekte     INT = 0;
+    DECLARE @m_max_idx             INT = 0;
     
     DECLARE @m_obj_id              INT;
-    DECLARE @m_objektart_id        INT; 
     DECLARE @m_gz                  NVARCHAR(150);
-    DECLARE @m_aussonderungsart    INT;
     DECLARE @m_aussondstatus       INT;
 	DECLARE @m_av3_enabled         INT;
     
@@ -820,30 +819,17 @@ BEGIN
     END;
     
     EXEC set_adm_id -1;
-    
-    CREATE TABLE #AUSSOND_SGO
-    (
-       idx INT IDENTITY PRIMARY KEY,
-       obj_id            INT,
-       objektart_id      INT,
-       gz                NVARCHAR(150),
-       aussonderungsart  INT,
-       aussondstatus     INT
-    );
 
     if ( LEN(ISNULL(@i_gz_mappe, '')) = 0 )
     BEGIN  
-       -- Wenn keine Aussonderungsmappe übergeben wurde, alles Aussonderungsfähige Schriftgut machen
-        
-        INSERT INTO #AUSSOND_SGO
+        -- Wenn keine Aussonderungsmappe übergeben wurde, alles Aussonderungsfähige Schriftgut machen
+        CREATE TABLE #AUSSOND_ROOTS
         (
-           obj_id,
-           objektart_id,
-           gz,
-           aussonderungsart,
-           aussondstatus
-        )
-        select OBJ_ID, 1, GZ, AUSSONDERUNGSART, AUSSONDSTATUS 
+           obj_id INT NOT NULL PRIMARY KEY
+        );
+        
+        INSERT INTO #AUSSOND_ROOTS ( obj_id )
+        select DISTINCT OBJ_ID
         from vsg_akte
         where ABGESCHLOSSEN = 1
         and AUSSONDERUNG_AM < getdate()
@@ -857,37 +843,16 @@ BEGIN
            -10938   -- an Archiv abgegeben
         );
         
-        SELECT @msg = CONVERT(NVARCHAR, COUNT(OBJ_ID)) + ' Akten mit Aussonderungsart Vernichten gefunden' FROM #AUSSOND_SGO;
+        SET @msg = CONVERT(NVARCHAR, @@ROWCOUNT) + ' Akten mit Aussonderungsart Vernichten gefunden';
         PRINT @msg;
         
-        WHILE @m_counter_objekte < (SELECT MAX(idx) FROM #AUSSOND_SGO)
-        BEGIN
-           SET @m_counter_objekte = @m_counter_objekte + 1;
-           
-           SELECT @m_obj_id = obj_id, 
-                  @m_objektart_id = objektart_id, 
-                  @m_gz = gz,
-                  @m_aussonderungsart = AUSSONDERUNGSART, 
-                  @m_aussondstatus = aussondstatus 
-             FROM #AUSSOND_SGO
-            WHERE idx = @m_counter_objekte;
-            
-           exec dbo.addon_aussondstatus_ex @m_obj_id, -10962, 0;       -- Aussonderungsstatus auf Langzeitspeicherung rekursiv setzen
-            
-        END; -- WHILE AUSSOND_SGOs
+        exec dbo.addon_aussondstatus_multi -10962, 0;       -- Aussonderungsstatus auf Langzeitspeicherung rekursiv setzen
         
-        TRUNCATE TABLE #AUSSOND_SGO;
-        SET @m_counter_objekte = 0;
+        -- Erst danach die Vorgänge ermitteln: Vorgänge unter den eben verarbeiteten Akten stehen jetzt auf -10962 und fallen raus
+        TRUNCATE TABLE #AUSSOND_ROOTS;
         
-        INSERT INTO #AUSSOND_SGO
-        (
-           obj_id,
-           objektart_id,
-           gz,
-           aussonderungsart,
-           aussondstatus
-        )
-        select OBJ_ID, 3, GZ, AUSSONDERUNGSART, AUSSONDSTATUS 
+        INSERT INTO #AUSSOND_ROOTS ( obj_id )
+        select DISTINCT OBJ_ID
         from vsg_vorgang
         where ABGESCHLOSSEN = 1
         and AUSSONDERUNG_AM < getdate()
@@ -901,24 +866,12 @@ BEGIN
            -10938   -- an Archiv abgegeben
         );
         
-        SELECT @msg = CONVERT(NVARCHAR, COUNT(OBJ_ID)) + ' Vorgänge mit Aussonderungsart Vernichten gefunden' FROM #AUSSOND_SGO;
+        SET @msg = CONVERT(NVARCHAR, @@ROWCOUNT) + ' Vorgänge mit Aussonderungsart Vernichten gefunden';
         PRINT @msg;
         
-        WHILE @m_counter_objekte < (SELECT MAX(idx) FROM #AUSSOND_SGO)
-        BEGIN
-           SET @m_counter_objekte = @m_counter_objekte + 1;
-           
-          SELECT @m_obj_id = obj_id, 
-                  @m_objektart_id = objektart_id, 
-                  @m_gz = gz,
-                  @m_aussonderungsart = AUSSONDERUNGSART, 
-                  @m_aussondstatus = aussondstatus 
-             FROM #AUSSOND_SGO
-            WHERE idx = @m_counter_objekte;
-            
-           exec dbo.addon_aussondstatus_ex @m_obj_id, -10962, 0;       -- Aussonderungsstatus auf Langzeitspeicherung rekursiv setzen
-            
-        END; -- WHILE AUSSOND_SGOs
+        exec dbo.addon_aussondstatus_multi -10962, 0;       -- Aussonderungsstatus auf Langzeitspeicherung rekursiv setzen
+        
+        DROP TABLE #AUSSOND_ROOTS;
     END;
     ELSE
     BEGIN
@@ -930,27 +883,33 @@ BEGIN
         
         if ( IsNULL(@mappe_obj_id ,0 ) > 0)
         BEGIN
+           CREATE TABLE #AUSSOND_SGO
+           (
+              idx INT IDENTITY PRIMARY KEY,
+              obj_id            INT,
+              gz                NVARCHAR(150),
+              aussondstatus     INT
+           );
            
            INSERT INTO #AUSSOND_SGO
            (
               obj_id,
-              objektart_id,
               gz,
-              aussonderungsart,
               aussondstatus
            )
-           select s.OBJ_ID, s.OBJEKTART_ID, s.GZ, s.AUSSONDERUNGSART, s.AUSSONDSTATUS 
+           select s.OBJ_ID, s.GZ, s.AUSSONDSTATUS 
            from vsg_mappeinhalt m 
-           inner join vis_prim_hierarchie h on h.vater_id = m.schriftgut_obj_id and primaer = 0
+           inner join vis_prim_hierarchie h on h.vater_id = m.schriftgut_obj_id and m.primaer = 0
            inner join vsg_schriftgut_view s on h.sohn_id = s.OBJ_ID
            where m.mappe_obj_id = @mappe_obj_id;
 
+           SET @m_max_idx = @@ROWCOUNT;
            SET @m_counter_objekte = 0;
 
-           SELECT @msg = CONVERT(NVARCHAR, COUNT(OBJ_ID)) + ' Geschäftsobjekte in der Mappe gefunden' FROM #AUSSOND_SGO;
+           SET @msg = CONVERT(NVARCHAR, @m_max_idx) + ' Geschäftsobjekte in der Mappe gefunden';
            PRINT @msg;
         
-           WHILE @m_counter_objekte < (SELECT MAX(idx) FROM #AUSSOND_SGO)
+           WHILE @m_counter_objekte < @m_max_idx
            BEGIN
               SET @m_counter_objekte = @m_counter_objekte + 1;
            
@@ -968,6 +927,8 @@ BEGIN
               END;
             
            END; -- WHILE AUSSOND_SGOs
+           
+           DROP TABLE #AUSSOND_SGO;
         END
         ELSE
         BEGIN
@@ -975,8 +936,6 @@ BEGIN
            PRINT @msg;
         END;
     END;
-    
-    DROP TABLE #AUSSOND_SGO;
 END
 -- addon_prep_loeschen
 GO
